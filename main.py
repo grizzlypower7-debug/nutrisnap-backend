@@ -3,12 +3,18 @@ NutriSnap backend — MVP сервер на FastAPI + SQLite.
 
 Функционал:
 - Хранит пользователей и их сканы в SQLite.
-- POST /scan-meal — принимает фото (файл) или текст, возвращает мок-анализ КБЖУ.
+- POST /scan-meal — принимает фото (файл) или текст, анализирует блюдо
+  через gpt-4o-mini (ProxyAPI) и возвращает КБЖУ.
 - Лимит: ровно 2 бесплатных скана в сутки на пользователя.
   На 3-й скан за день — 402 Payment Required с сообщением
   "Limit reached. Upgrade to Premium".
+- Если ИИ недоступен (нет ключа, сбой сети, невалидный ответ) — сервер
+  никогда не падает и тихо откатывается на тестовый mock-результат.
 """
 
+import base64
+import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
@@ -16,10 +22,29 @@ from typing import Optional
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
 
 DB_PATH = "nutrisnap.db"
 FREE_DAILY_LIMIT = 2  # <-- ровно 2 бесплатных скана в день
+
+AI_MODEL = "gpt-4o-mini"
+AI_SYSTEM_PROMPT = (
+    "Ты — профессиональный нутрициолог. Оцени тарелку на фото или текст. "
+    "Верни СТРОГО чистый JSON без маркдауна: "
+    '{"meal": "Название блюда на русском", "calories": 450, "protein": 30, '
+    '"fat": 12, "carbs": 45}'
+)
+
+api_key = os.getenv("OPENAI_API_KEY")
+client = (
+    OpenAI(
+        api_key=api_key,
+        base_url="https://api.proxyapi.ru/openai/v1",
+    )
+    if api_key
+    else None
+)
 
 app = FastAPI(title="NutriSnap API")
 
@@ -116,7 +141,8 @@ def count_scans_today(conn: sqlite3.Connection, user_id: int) -> int:
 def mock_analyze_meal() -> dict:
     """
     Заглушка (mock) анализа еды.
-    Позже здесь будет вызов реальной модели (Vision/ASR + LLM).
+    Используется как fallback, если ИИ недоступен или вернул невалидный ответ —
+    сервер никогда не должен падать из-за проблем с внешним API.
     """
     return {
         "meal": "Куриное филе с рисом",
@@ -125,6 +151,91 @@ def mock_analyze_meal() -> dict:
         "fat": 6,
         "carbs": 50,
     }
+
+
+def _parse_ai_json(raw_content: str) -> dict:
+    """
+    Парсит ответ модели в dict и валидирует обязательные поля.
+    Бросает исключение при любой проблеме — вызывающий код ловит его
+    и откатывается на mock_analyze_meal().
+    """
+    content = raw_content.strip()
+
+    # На случай, если модель всё же обернула JSON в ```...``` markdown-блок
+    if content.startswith("```"):
+        content = content.strip("`")
+        if content.lower().startswith("json"):
+            content = content[4:]
+        content = content.strip()
+
+    data = json.loads(content)
+
+    result = {
+        "meal": str(data["meal"]),
+        "calories": int(round(float(data["calories"]))),
+        "protein": int(round(float(data["protein"]))),
+        "fat": int(round(float(data["fat"]))),
+        "carbs": int(round(float(data["carbs"]))),
+    }
+    return result
+
+
+def analyze_meal_text(text: str) -> dict:
+    """Анализ текстового описания еды через gpt-4o-mini (ProxyAPI)."""
+    if client is None:
+        return mock_analyze_meal()
+
+    try:
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+        raw_content = response.choices[0].message.content
+        return _parse_ai_json(raw_content)
+    except Exception as exc:  # сеть, лимиты API, невалидный JSON и т.д.
+        print(f"[NutriSnap] Ошибка анализа текста через ИИ, использую mock: {exc}")
+        return mock_analyze_meal()
+
+
+def analyze_meal_photo(image_bytes: bytes, content_type: str) -> dict:
+    """Анализ фото тарелки через Vision API gpt-4o-mini (ProxyAPI)."""
+    if client is None:
+        return mock_analyze_meal()
+
+    try:
+        mime = content_type if content_type else "image/jpeg"
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+        data_url = f"data:{mime};base64,{b64_image}"
+
+        response = client.chat.completions.create(
+            model=AI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": AI_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Оцени калорийность и БЖУ блюда на этом фото.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url},
+                        },
+                    ],
+                },
+            ],
+        )
+        raw_content = response.choices[0].message.content
+        return _parse_ai_json(raw_content)
+    except Exception as exc:  # сеть, лимиты API, невалидный JSON и т.д.
+        print(f"[NutriSnap] Ошибка анализа фото через ИИ, использую mock: {exc}")
+        return mock_analyze_meal()
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +277,12 @@ async def scan_meal(
                     detail="Limit reached. Upgrade to Premium",
                 )
 
-        # --- MOCK: тут в будущем будет реальный ИИ-анализ фото/текста ---
-        result = mock_analyze_meal()
+        # --- Реальный ИИ-анализ (gpt-4o-mini через ProxyAPI), с fallback на mock ---
+        if photo is not None:
+            image_bytes = await photo.read()
+            result = analyze_meal_photo(image_bytes, photo.content_type)
+        else:
+            result = analyze_meal_text(text)
 
         input_type = "photo" if photo is not None else "text"
         today = date.today().isoformat()
