@@ -5,9 +5,9 @@ NutriSnap backend — MVP сервер на FastAPI + SQLite.
 - Хранит пользователей и их сканы в SQLite.
 - POST /scan-meal — принимает фото (файл) или текст, анализирует блюдо
   через gpt-4o-mini (ProxyAPI) и возвращает КБЖУ.
-- Лимит: ровно 2 бесплатных скана в сутки на пользователя.
-  На 3-й скан за день — 402 Payment Required с сообщением
-  "Limit reached. Upgrade to Premium".
+- Лимит: ровно 2 бесплатных скана за последние 24 часа (скользящее окно,
+  86400 секунд, а не календарный день). На 3-й скан подряд за это время —
+  402 Payment Required с сообщением "Limit reached. Upgrade to Premium".
 - Если ИИ недоступен (нет ключа, сбой сети, невалидный ответ) — сервер
   никогда не падает и тихо откатывается на тестовый mock-результат.
 """
@@ -26,7 +26,8 @@ from openai import OpenAI
 from pydantic import BaseModel
 
 DB_PATH = "nutrisnap.db"
-FREE_DAILY_LIMIT = 2  # <-- ровно 2 бесплатных скана в день
+FREE_DAILY_LIMIT = 2  # <-- ровно 2 бесплатных скана за скользящее окно в 24 часа
+LIMIT_WINDOW_SECONDS = 86400  # 24 часа
 
 AI_MODEL = "gpt-4o-mini"
 AI_SYSTEM_PROMPT = (
@@ -129,13 +130,45 @@ def get_or_create_user(conn: sqlite3.Connection, telegram_id: str) -> sqlite3.Ro
     return user
 
 
-def count_scans_today(conn: sqlite3.Connection, user_id: int) -> int:
-    today = date.today().isoformat()
+def count_scans_last_24h(conn: sqlite3.Connection, user_id: int) -> int:
+    """Сколько сканов пользователь сделал за последние 86400 секунд (скользящее окно)."""
     row = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM scans WHERE user_id = ? AND scan_date = ?",
-        (user_id, today),
+        """
+        SELECT COUNT(*) AS cnt FROM scans
+        WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
+        """,
+        (user_id,),
     ).fetchone()
     return row["cnt"]
+
+
+def seconds_until_next_scan(conn: sqlite3.Connection, user_id: int) -> int:
+    """
+    Через сколько секунд освободится следующий бесплатный скан —
+    то есть когда самому старому скану за последние 24 часа "стукнет" 24 часа.
+    Возвращает 0, если сканов за окно нет (лимит не исчерпан).
+    """
+    row = conn.execute(
+        """
+        SELECT MIN(created_at) AS oldest FROM scans
+        WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
+        """,
+        (user_id,),
+    ).fetchone()
+    if row is None or row["oldest"] is None:
+        return 0
+
+    remaining_row = conn.execute(
+        """
+        SELECT CAST(
+            ROUND((julianday(?) + 1 - julianday('now')) * 86400)
+            AS INTEGER
+        ) AS remaining
+        """,
+        (row["oldest"],),
+    ).fetchone()
+    remaining = remaining_row["remaining"] if remaining_row else 0
+    return max(remaining, 0)
 
 
 def mock_analyze_meal() -> dict:
@@ -225,7 +258,7 @@ def analyze_meal_photo(image_bytes: bytes, content_type: str) -> dict:
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": data_url},
+                            "image_url": {"url": data_url, "detail": "low"},
                         },
                     ],
                 },
@@ -250,6 +283,7 @@ class ScanResult(BaseModel):
     carbs: int
     scans_used_today: int
     scans_left_today: int
+    next_scan_in_seconds: int
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +304,15 @@ async def scan_meal(
 
         # Премиум-пользователей лимит не касается
         if not user["is_premium"]:
-            used_today = count_scans_today(conn, user["id"])
-            if used_today >= FREE_DAILY_LIMIT:
+            used_last_24h = count_scans_last_24h(conn, user["id"])
+            if used_last_24h >= FREE_DAILY_LIMIT:
+                next_in = seconds_until_next_scan(conn, user["id"])
                 raise HTTPException(
                     status_code=402,
-                    detail="Limit reached. Upgrade to Premium",
+                    detail={
+                        "message": "Limit reached. Upgrade to Premium",
+                        "next_scan_in_seconds": next_in,
+                    },
                 )
 
         # --- Реальный ИИ-анализ (gpt-4o-mini через ProxyAPI), с fallback на mock ---
@@ -305,29 +343,33 @@ async def scan_meal(
             ),
         )
 
-        used_after = count_scans_today(conn, user["id"])
+        used_after = count_scans_last_24h(conn, user["id"])
         left = max(FREE_DAILY_LIMIT - used_after, 0) if not user["is_premium"] else -1
+        next_in = 0 if user["is_premium"] or left > 0 else seconds_until_next_scan(conn, user["id"])
 
         return ScanResult(
             **result,
             scans_used_today=used_after,
             scans_left_today=left,
+            next_scan_in_seconds=next_in,
         )
 
 
 @app.get("/scan-meal/status")
 def scan_status(telegram_id: str):
-    """Узнать, сколько сканов осталось сегодня, не тратя лимит."""
+    """Узнать, сколько сканов осталось за последние 24 часа, не тратя лимит."""
     with get_db() as conn:
         user = get_or_create_user(conn, telegram_id)
-        used = count_scans_today(conn, user["id"])
+        used = count_scans_last_24h(conn, user["id"])
         left = max(FREE_DAILY_LIMIT - used, 0) if not user["is_premium"] else -1
+        next_in = 0 if user["is_premium"] or left > 0 else seconds_until_next_scan(conn, user["id"])
         return {
             "telegram_id": telegram_id,
             "is_premium": bool(user["is_premium"]),
             "scans_used_today": used,
             "scans_left_today": left,
             "daily_limit": FREE_DAILY_LIMIT,
+            "next_scan_in_seconds": next_in,
         }
 
 
