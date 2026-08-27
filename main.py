@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 
-DB_PATH = "nutrisnap.db"
+DB_PATH = os.getenv("DB_PATH", "nutrisnap.db")
 FREE_DAILY_LIMIT = 2  # <-- ровно 2 бесплатных скана за скользящее окно в 24 часа
 LIMIT_WINDOW_SECONDS = 86400  # 24 часа
 
