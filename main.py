@@ -1,15 +1,26 @@
 """
-NutriSnap backend — MVP сервер на FastAPI + SQLite.
+NutriSnap backend — FastAPI сервер с поддержкой SQLite (для локальной
+разработки) и PostgreSQL (для продакшена, например Neon.tech + Render).
 
 Функционал:
-- Хранит пользователей и их сканы в SQLite.
+- Хранит пользователей и их сканы. По умолчанию — в SQLite-файле рядом
+  с сервером. Если задана переменная окружения DATABASE_URL — все данные
+  идут в PostgreSQL (Neon и подобные), что переживает redeploy на Render
+  даже без платного постоянного диска.
 - POST /scan-meal — принимает фото (файл) или текст, анализирует блюдо
   через gpt-4o-mini (ProxyAPI) и возвращает КБЖУ.
-- Лимит: ровно 2 бесплатных скана за последние 24 часа (скользящее окно,
-  86400 секунд, а не календарный день). На 3-й скан подряд за это время —
-  402 Payment Required с сообщением "Limit reached. Upgrade to Premium".
+- Лимит: ровно 2 бесплатных скана за скользящее окно в 24 часа (86400
+  секунд от МОМЕНТА конкретного скана, а не от календарной полуночи).
+  На 3-й скан за окно — 402 Payment Required с полем next_scan_in_seconds.
+- Telegram Stars: /create-star-invoice + /confirm-payment активируют
+  Premium на 30 дней (premium_until), который полностью снимает лимит.
 - Если ИИ недоступен (нет ключа, сбой сети, невалидный ответ) — сервер
   никогда не падает и тихо откатывается на тестовый mock-результат.
+
+Все временные метки везде трактуются как "наивный" UTC (без tzinfo) —
+и в SQLite (TEXT в формате 'YYYY-MM-DD HH:MM:SS'), и в PostgreSQL
+(TIMESTAMP WITHOUT TIME ZONE) — чтобы сравнения между Python/SQLite/
+PostgreSQL всегда были на одной временной шкале.
 """
 
 import base64
@@ -26,7 +37,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 
-DB_PATH = os.getenv("DB_PATH", "nutrisnap.db")
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:  # psycopg2-binary мог быть не установлен в чисто sqlite-окружении
+    psycopg2 = None
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # например, строка подключения Neon.tech
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES and psycopg2 is None:
+    raise RuntimeError(
+        "DATABASE_URL задан, но psycopg2 не установлен. "
+        "Добавьте psycopg2-binary в requirements.txt и переустановите зависимости."
+    )
+
+DB_PATH = os.getenv("DB_PATH", "nutrisnap.db")  # используется только для SQLite-фоллбэка
+
 FREE_DAILY_LIMIT = 2  # <-- ровно 2 бесплатных скана за скользящее окно в 24 часа
 LIMIT_WINDOW_SECONDS = 86400  # 24 часа
 
@@ -67,131 +98,245 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# База данных
+# Слой доступа к БД: единый интерфейс поверх SQLite и PostgreSQL.
+#
+# Бизнес-логика (лимиты, Stars, ИИ) ничего не знает о том, какая именно
+# СУБД используется — она просто вызывает db_execute(conn, sql, params)
+# и читает строки как словарь (row["colname"]), что одинаково работает
+# и для sqlite3.Row, и для psycopg2 RealDictCursor.
+#
+# ВАЖНО (продакшен): здесь каждый запрос открывает новое соединение с БД
+# и закрывает его в конце ("connect-per-request"). Для демо/MVP с Neon
+# free tier этого достаточно, но под реальной нагрузкой лучше завести
+# пул соединений (psycopg2.pool / SQLAlchemy) — открытие нового TCP+TLS
+# соединения на КАЖДЫЙ HTTP-запрос заметно медленнее и может упереться
+# в лимит одновременных соединений бесплатного плана Neon.
 # ---------------------------------------------------------------------------
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_execute(conn, sql: str, params: tuple = ()):
+    """
+    Выполняет запрос и возвращает объект с .fetchone()/.fetchall(),
+    одинаково для sqlite3.Connection и psycopg2-соединения.
+    """
+    if USE_POSTGRES:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur
+    return conn.execute(sql, params)
 
 
 def init_db():
     with get_db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT UNIQUE NOT NULL,
-                daily_limit INTEGER NOT NULL DEFAULT 2,
-                is_premium INTEGER NOT NULL DEFAULT 0,
-                premium_until TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        if USE_POSTGRES:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id TEXT UNIQUE NOT NULL,
+                    daily_limit INTEGER NOT NULL DEFAULT 2,
+                    is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+                    premium_until TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
+                )
+                """,
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                scan_date TEXT NOT NULL,   -- YYYY-MM-DD, для подсчёта дневного лимита
-                input_type TEXT NOT NULL,  -- 'photo' | 'text'
-                meal_name TEXT,
-                calories INTEGER,
-                protein INTEGER,
-                fat INTEGER,
-                carbs INTEGER,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS scans (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    scan_date TEXT NOT NULL,
+                    input_type TEXT NOT NULL,
+                    meal_name TEXT,
+                    calories INTEGER,
+                    protein INTEGER,
+                    fat INTEGER,
+                    carbs INTEGER,
+                    created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
+                )
+                """,
             )
-            """
-        )
-        # Миграция: если БД была создана до появления premium_until, добавляем колонку.
-        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-        if "premium_until" not in existing_columns:
-            conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
+            # Миграция на случай, если таблица users была создана до premium_until
+            cur = db_execute(
+                conn,
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'users'",
+            )
+            existing_columns = {row["column_name"] for row in cur.fetchall()}
+            if "premium_until" not in existing_columns:
+                db_execute(conn, "ALTER TABLE users ADD COLUMN premium_until TIMESTAMP")
+        else:
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id TEXT UNIQUE NOT NULL,
+                    daily_limit INTEGER NOT NULL DEFAULT 2,
+                    is_premium INTEGER NOT NULL DEFAULT 0,
+                    premium_until TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """,
+            )
+            db_execute(
+                conn,
+                """
+                CREATE TABLE IF NOT EXISTS scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    scan_date TEXT NOT NULL,
+                    input_type TEXT NOT NULL,
+                    meal_name TEXT,
+                    calories INTEGER,
+                    protein INTEGER,
+                    fat INTEGER,
+                    carbs INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """,
+            )
+            existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+            if "premium_until" not in existing_columns:
+                db_execute(conn, "ALTER TABLE users ADD COLUMN premium_until TEXT")
 
 
 @app.on_event("startup")
 def on_startup():
     init_db()
+    print(f"[NutriSnap] БД: {'PostgreSQL (DATABASE_URL)' if USE_POSTGRES else f'SQLite ({DB_PATH})'}")
 
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
-def get_or_create_user(conn: sqlite3.Connection, telegram_id: str) -> sqlite3.Row:
-    user = conn.execute(
-        "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
-    ).fetchone()
+def get_or_create_user(conn, telegram_id: str):
+    ph = "%s" if USE_POSTGRES else "?"
+    cur = db_execute(conn, f"SELECT * FROM users WHERE telegram_id = {ph}", (telegram_id,))
+    user = cur.fetchone()
     if user is None:
-        conn.execute(
-            "INSERT INTO users (telegram_id, daily_limit) VALUES (?, ?)",
+        db_execute(
+            conn,
+            f"INSERT INTO users (telegram_id, daily_limit) VALUES ({ph}, {ph})",
             (telegram_id, FREE_DAILY_LIMIT),
         )
-        user = conn.execute(
-            "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
-        ).fetchone()
+        cur = db_execute(conn, f"SELECT * FROM users WHERE telegram_id = {ph}", (telegram_id,))
+        user = cur.fetchone()
     return user
 
 
-def is_premium_active(user_row: sqlite3.Row) -> bool:
+def _as_naive_utc_datetime(value) -> Optional[datetime]:
+    """
+    Приводит значение времени из БД (строка из SQLite или datetime из
+    PostgreSQL) к единому "наивному" datetime в UTC для сравнений в Python.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    return None
+
+
+def _format_dt(value: Optional[datetime]) -> Optional[str]:
+    """Единый строковый формат даты для JSON-ответов API, независимо от СУБД."""
+    if value is None:
+        return None
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_premium_active(user_row) -> bool:
     """True, если premium_until в будущем — тогда 24-часовой лимит не начисляется."""
-    premium_until = user_row["premium_until"]
-    if not premium_until:
-        return False
-    try:
-        premium_dt = datetime.strptime(premium_until, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+    premium_dt = _as_naive_utc_datetime(user_row["premium_until"])
+    if premium_dt is None:
         return False
     return premium_dt > datetime.utcnow()
 
 
-def count_scans_last_24h(conn: sqlite3.Connection, user_id: int) -> int:
+def count_scans_last_24h(conn, user_id: int) -> int:
     """Сколько сканов пользователь сделал за последние 86400 секунд (скользящее окно)."""
-    row = conn.execute(
-        """
-        SELECT COUNT(*) AS cnt FROM scans
-        WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
-        """,
-        (user_id,),
-    ).fetchone()
-    return row["cnt"]
+    if USE_POSTGRES:
+        cur = db_execute(
+            conn,
+            """
+            SELECT COUNT(*) AS cnt FROM scans
+            WHERE user_id = %s AND created_at >= (NOW() AT TIME ZONE 'utc') - INTERVAL '1 day'
+            """,
+            (user_id,),
+        )
+    else:
+        cur = db_execute(
+            conn,
+            """
+            SELECT COUNT(*) AS cnt FROM scans
+            WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
+            """,
+            (user_id,),
+        )
+    return cur.fetchone()["cnt"]
 
 
-def seconds_until_next_scan(conn: sqlite3.Connection, user_id: int) -> int:
+def seconds_until_next_scan(conn, user_id: int) -> int:
     """
     Через сколько секунд освободится следующий бесплатный скан —
     то есть когда самому старому скану за последние 24 часа "стукнет" 24 часа.
     Возвращает 0, если сканов за окно нет (лимит не исчерпан).
+    Расчёт делается в Python (единообразно для SQLite и PostgreSQL), а не
+    в SQL, чтобы не дублировать арифметику дат на двух диалектах.
     """
-    row = conn.execute(
-        """
-        SELECT MIN(created_at) AS oldest FROM scans
-        WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
-        """,
-        (user_id,),
-    ).fetchone()
-    if row is None or row["oldest"] is None:
+    if USE_POSTGRES:
+        cur = db_execute(
+            conn,
+            """
+            SELECT MIN(created_at) AS oldest FROM scans
+            WHERE user_id = %s AND created_at >= (NOW() AT TIME ZONE 'utc') - INTERVAL '1 day'
+            """,
+            (user_id,),
+        )
+    else:
+        cur = db_execute(
+            conn,
+            """
+            SELECT MIN(created_at) AS oldest FROM scans
+            WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
+            """,
+            (user_id,),
+        )
+    row = cur.fetchone()
+    oldest = _as_naive_utc_datetime(row["oldest"]) if row else None
+    if oldest is None:
         return 0
 
-    remaining_row = conn.execute(
-        """
-        SELECT CAST(
-            ROUND((julianday(?) + 1 - julianday('now')) * 86400)
-            AS INTEGER
-        ) AS remaining
-        """,
-        (row["oldest"],),
-    ).fetchone()
-    remaining = remaining_row["remaining"] if remaining_row else 0
-    return max(remaining, 0)
+    remaining = (oldest + timedelta(seconds=LIMIT_WINDOW_SECONDS) - datetime.utcnow()).total_seconds()
+    return max(int(round(remaining)), 0)
 
 
 def mock_analyze_meal() -> dict:
@@ -350,12 +495,14 @@ async def scan_meal(
 
         input_type = "photo" if photo is not None else "text"
         today = date.today().isoformat()
+        ph = "%s" if USE_POSTGRES else "?"
 
-        conn.execute(
-            """
+        db_execute(
+            conn,
+            f"""
             INSERT INTO scans
                 (user_id, scan_date, input_type, meal_name, calories, protein, fat, carbs)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
             """,
             (
                 user["id"],
@@ -379,7 +526,7 @@ async def scan_meal(
             scans_left_today=left,
             next_scan_in_seconds=next_in,
             is_premium=premium_active,
-            premium_until=user["premium_until"] if premium_active else None,
+            premium_until=_format_dt(_as_naive_utc_datetime(user["premium_until"])) if premium_active else None,
         )
 
 
@@ -395,7 +542,7 @@ def scan_status(telegram_id: str):
         return {
             "telegram_id": telegram_id,
             "is_premium": premium_active,
-            "premium_until": user["premium_until"] if premium_active else None,
+            "premium_until": _format_dt(_as_naive_utc_datetime(user["premium_until"])) if premium_active else None,
             "scans_used_today": used,
             "scans_left_today": left,
             "daily_limit": FREE_DAILY_LIMIT,
@@ -459,22 +606,29 @@ def confirm_payment(telegram_id: str = Form(...)):
     """
     with get_db() as conn:
         user = get_or_create_user(conn, telegram_id)
-        new_premium_until = (
-            datetime.utcnow() + timedelta(seconds=PREMIUM_DURATION_SECONDS)
-        ).strftime("%Y-%m-%d %H:%M:%S")
+        new_premium_until = datetime.utcnow() + timedelta(seconds=PREMIUM_DURATION_SECONDS)
+        ph = "%s" if USE_POSTGRES else "?"
 
-        conn.execute(
-            "UPDATE users SET premium_until = ? WHERE id = ?",
-            (new_premium_until, user["id"]),
+        db_execute(
+            conn,
+            f"UPDATE users SET premium_until = {ph} WHERE id = {ph}",
+            (
+                new_premium_until if USE_POSTGRES else new_premium_until.strftime("%Y-%m-%d %H:%M:%S"),
+                user["id"],
+            ),
         )
 
         return {
             "telegram_id": telegram_id,
             "is_premium": True,
-            "premium_until": new_premium_until,
+            "premium_until": _format_dt(new_premium_until),
         }
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "NutriSnap API"}
+    return {
+        "status": "ok",
+        "service": "NutriSnap API",
+        "database": "postgresql" if USE_POSTGRES else "sqlite",
+    }
